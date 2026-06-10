@@ -31,11 +31,25 @@ type InterfaceSummary = {
   summary: string;
   operationId: string;
   tags: string[];
+  apifoxFolders: string[];
+  apifoxTags: string[];
 };
 
 type SearchMatch = {
   moduleName: string;
   score: number;
+};
+
+type InterfaceMatch = {
+  method: string;
+  path: string;
+  summary: string;
+  operationId: string;
+  tags: string[];
+  apifoxFolders: string[];
+  apifoxTags: string[];
+  score: number;
+  matchedFields: string[];
 };
 
 const OPENAPI_METHODS = ["get", "post", "put", "delete", "patch"] as const;
@@ -198,6 +212,24 @@ export class ApiFoxServer {
     return this.dedupeStrings(candidates);
   }
 
+  private extractTextArray(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    return this.dedupeStrings(
+      value
+        .map((item) => (typeof item === "string" ? item.trim() : ""))
+        .filter(Boolean)
+    );
+  }
+
+  private collectPathEvidence(value: unknown): string[] {
+    const evidence: string[] = [];
+    this.collectStrings(value, evidence);
+    return this.dedupeStrings(evidence);
+  }
+
   private scoreKeywordMatch(keyword: string, candidate: string): number {
     const normalizedKeyword = this.normalizeSearchText(keyword);
     const normalizedCandidate = this.normalizeSearchText(candidate);
@@ -263,6 +295,57 @@ export class ApiFoxServer {
     return Math.min(score, 100);
   }
 
+  private scoreInterfaceMatch(keyword: string, item: InterfaceSummary): {
+    score: number;
+    matchedFields: string[];
+  } {
+    const matchedFields: string[] = [];
+    let score = 0;
+
+    const fields: Array<[string, string, number]> = [
+      ["summary", item.summary, 100],
+      ["path", item.path, 95],
+      ["operationId", item.operationId, 85],
+      ["tags", item.tags.join(" "), 80],
+      ["apifoxFolders", item.apifoxFolders.join(" "), 90],
+      ["apifoxTags", item.apifoxTags.join(" "), 88],
+    ];
+
+    for (const [fieldName, fieldValue, weight] of fields) {
+      const fieldScore = this.scoreKeywordMatch(keyword, fieldValue);
+      if (fieldScore > 0) {
+        matchedFields.push(fieldName);
+        score += Math.round((fieldScore * weight) / 100);
+      }
+    }
+
+    const evidenceTexts = [
+      item.summary,
+      item.path,
+      item.operationId,
+      ...item.tags,
+      ...item.apifoxFolders,
+      ...item.apifoxTags,
+    ];
+    const normalizedKeyword = this.normalizeSearchText(keyword);
+    const normalizedEvidence = this.normalizeSearchText(evidenceTexts.join(" "));
+    if (normalizedKeyword && normalizedEvidence.includes(normalizedKeyword)) {
+      score += 15;
+    }
+
+    if (matchedFields.length === 0) {
+      return {
+        score: 0,
+        matchedFields: [],
+      };
+    }
+
+    return {
+      score: Math.min(score, 100),
+      matchedFields: this.dedupeStrings(matchedFields),
+    };
+  }
+
   private async fetchOpenApiDocument(): Promise<OpenApiDocument | null> {
     const response = await fetch(
       `https://api.apifox.com/v1/projects/${this.projectId}/export-openapi`,
@@ -320,12 +403,9 @@ export class ApiFoxServer {
           typeof operationRecord.operationId === "string"
             ? operationRecord.operationId
             : "";
-        const operationTags = Array.isArray(operationRecord.tags)
-          ? operationRecord.tags
-              .filter((tag): tag is string => typeof tag === "string")
-              .map((tag) => tag.trim())
-              .filter(Boolean)
-          : [];
+        const operationTags = this.extractTextArray(operationRecord.tags);
+        const apifoxFolders = this.collectPathEvidence(operationRecord["x-apifox-folder"]);
+        const apifoxTags = this.collectPathEvidence(operationRecord["x-apifox-tags"]);
 
         interfaces.push({
           method: method.toUpperCase(),
@@ -333,6 +413,8 @@ export class ApiFoxServer {
           summary,
           operationId,
           tags: operationTags,
+          apifoxFolders,
+          apifoxTags,
         });
       }
     }
@@ -410,25 +492,39 @@ export class ApiFoxServer {
     };
   }
 
-  private extractInterfacesForTag(
-    tag: string,
-    interfaces: InterfaceSummary[]
-  ): InterfaceSummary[] {
-    const normalizedTag = this.normalizeSearchText(tag);
-    return interfaces.filter((item) => {
-      if (item.tags.includes(tag)) {
-        return true;
+  private searchInterfaces(keyword: string, interfaces: InterfaceSummary[]): InterfaceMatch[] {
+    const matches: InterfaceMatch[] = [];
+
+    for (const item of interfaces) {
+      const { score, matchedFields } = this.scoreInterfaceMatch(keyword, item);
+      if (score <= 0) {
+        continue;
       }
 
-      const searchable = [item.summary, item.operationId, item.path, ...item.tags];
-      return searchable.some((value) => {
-        const normalizedValue = this.normalizeSearchText(value);
-        return (
-          normalizedValue.includes(normalizedTag) ||
-          normalizedTag.includes(normalizedValue)
-        );
+      matches.push({
+        method: item.method,
+        path: item.path,
+        summary: item.summary,
+        operationId: item.operationId,
+        tags: item.tags,
+        apifoxFolders: item.apifoxFolders,
+        apifoxTags: item.apifoxTags,
+        score,
+        matchedFields,
       });
+    }
+
+    matches.sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+
+      const leftKey = `${left.method} ${left.path}`;
+      const rightKey = `${right.method} ${right.path}`;
+      return leftKey.localeCompare(rightKey, "zh-Hans-CN");
     });
+
+    return matches.slice(0, 20);
   }
 
   private async handleSearchModule(
@@ -470,12 +566,44 @@ export class ApiFoxServer {
     };
   }
 
-  private async handleGetInterface(moduleName: string): Promise<unknown> {
-    console.error("[get-interface] moduleName=", moduleName);
+  private async handleSearchInterface(keyword: string): Promise<
+    | {
+        keyword: string;
+        matched: InterfaceMatch[];
+        candidateCount: number;
+      }
+    | {
+        error: string;
+      }
+  > {
+    console.log("[search-interface] keyword=", keyword);
 
-    if (!moduleName || !moduleName.trim()) {
+    const openapi = await this.fetchOpenApiDocument();
+    if (!openapi) {
       return {
-        error: "moduleName 不能为空",
+        error: "无法解析 Apifox OpenAPI 数据",
+      };
+    }
+
+    const { tags, interfaces } = this.buildOpenApiInterfaceSummary(openapi);
+    console.log("[search-interface] openapi tags count=", tags.length);
+
+    const matched = this.searchInterfaces(keyword, interfaces);
+    console.log("[search-interface] matched count=", matched.length);
+
+    return {
+      keyword,
+      matched,
+      candidateCount: interfaces.length,
+    };
+  }
+
+  private async handleGetInterface(keyword: string): Promise<unknown> {
+    console.error("[get-interface] keyword=", keyword);
+
+    if (!keyword || !keyword.trim()) {
+      return {
+        error: "keyword 不能为空",
       };
     }
 
@@ -486,22 +614,31 @@ export class ApiFoxServer {
       };
     }
 
-    const { tags, interfaces } = this.buildOpenApiInterfaceSummary(openapi);
-    const bestTag = this.findBestTagForModule(moduleName, tags, interfaces);
-    if (!bestTag.tag) {
+    const { interfaces } = this.buildOpenApiInterfaceSummary(openapi);
+    const matched = this.searchInterfaces(keyword, interfaces);
+
+    if (matched.length === 0) {
       return {
-        moduleName,
-        error: "未找到匹配的 tag",
+        keyword,
+        error: "未找到匹配的接口",
       };
     }
 
-    const matchedInterfaces = this.extractInterfacesForTag(bestTag.tag, interfaces);
+    const best = matched[0];
     return {
-      moduleName,
-      matchedTag: bestTag.tag,
-      score: bestTag.score,
-      interfaceCount: matchedInterfaces.length,
-      interfaces: matchedInterfaces.slice(0, 100),
+      keyword,
+      matchedInterface: {
+        method: best.method,
+        path: best.path,
+        summary: best.summary,
+        operationId: best.operationId,
+        tags: best.tags,
+        apifoxFolders: best.apifoxFolders,
+        apifoxTags: best.apifoxTags,
+      },
+      score: best.score,
+      matchedFields: best.matchedFields,
+      candidateCount: matched.length,
     };
   }
 
@@ -523,13 +660,25 @@ export class ApiFoxServer {
     );
 
     this.server.tool(
-      "get-interface",
-      "根据模块名称获取 Apifox OpenAPI 接口摘要",
+      "search-interface",
+      "根据关键词搜索 Apifox 接口，返回最相关的接口候选",
       {
-        moduleName: z.string().min(1).describe("模块名称，例如 采购管理"),
+        keyword: z.string().min(1).describe("接口关键词，例如 采购订单列表、查询订单、更新SKU"),
       },
-      async (args: { moduleName: string }) => {
-        const result = await this.handleGetInterface(args.moduleName);
+      async (args: { keyword: string }) => {
+        const result = await this.handleSearchInterface(args.keyword);
+        return this.toTextContent(result);
+      }
+    );
+
+    this.server.tool(
+      "get-interface",
+      "根据关键词获取最匹配的 Apifox 接口",
+      {
+        keyword: z.string().min(1).describe("接口关键词，例如 采购订单列表、查询订单"),
+      },
+      async (args: { keyword: string }) => {
+        const result = await this.handleGetInterface(args.keyword);
         return this.toTextContent(result);
       }
     );
