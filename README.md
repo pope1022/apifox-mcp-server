@@ -11,6 +11,17 @@
 
 这是一个基于 Model Context Protocol (MCP) 的 ApiFox 接口服务器，用于获取和管理 ApiFox 的接口信息。通过在 Cursor 中配置 MCP 服务，获取对应接口模块信息返回给大模型，让 Cursor 通过接口信息帮助你实现业务逻辑。
 
+## Agent Prompt
+
+如果你要把这个服务接到 ERP 智能查询助手，请直接使用仓库中的 [AGENT_PROMPT.md](/Users/pope/apifox-mcp-server-git/AGENT_PROMPT.md)。
+
+当前服务暴露的核心工具包括：
+
+- `search-module`
+- `search-interface`
+- `get-interface`
+- `call-erp-api`
+
 ## 功能特点
 
 - 支持通过 MCP 协议获取 ApiFox 接口信息

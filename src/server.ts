@@ -111,6 +111,34 @@ export class ApiFoxServer {
     }
   }
 
+  private serializeQueryValue(value: unknown): string[] {
+    if (value === null || value === undefined) {
+      return [];
+    }
+
+    if (Array.isArray(value)) {
+      return value.flatMap((item) => this.serializeQueryValue(item));
+    }
+
+    if (value instanceof Date) {
+      return [value.toISOString()];
+    }
+
+    if (typeof value === "object") {
+      return [JSON.stringify(value)];
+    }
+
+    return [String(value)];
+  }
+
+  private appendQueryParams(url: URL, query: Record<string, unknown>): void {
+    for (const [key, value] of Object.entries(query)) {
+      for (const serialized of this.serializeQueryValue(value)) {
+        url.searchParams.append(key, serialized);
+      }
+    }
+  }
+
   private normalizeSearchText(value: string): string {
     return value
       .trim()
@@ -374,6 +402,49 @@ export class ApiFoxServer {
     }
 
     return parsed as OpenApiDocument;
+  }
+
+  private async callErpApi(args: {
+    method: "GET" | "POST" | "PUT" | "DELETE";
+    path: string;
+    query?: Record<string, unknown>;
+    body?: Record<string, unknown>;
+    token: string;
+  }): Promise<unknown> {
+    const url = new URL(args.path, "https://erpapik.keychron.cn");
+
+    if (args.query && Object.keys(args.query).length > 0) {
+      this.appendQueryParams(url, args.query);
+    }
+
+    const init: RequestInit = {
+      method: args.method,
+      headers: {
+        Authorization: `Bearer ${args.token}`,
+        "Content-Type": "application/json",
+      },
+    };
+
+    if (args.method === "POST" || args.method === "PUT") {
+      init.body =
+        args.body && Object.keys(args.body).length > 0
+          ? JSON.stringify(args.body)
+          : JSON.stringify({});
+    }
+
+    const response = await fetch(url, init);
+    const rawText = await response.text();
+    const parsed = this.safeJsonParse(rawText);
+
+    if (parsed && typeof parsed === "object") {
+      return parsed;
+    }
+
+    return {
+      error: "无法解析 ERP 接口返回的 JSON",
+      status: response.status,
+      raw: this.summarizeText(rawText),
+    };
   }
 
   private buildOpenApiInterfaceSummary(data: OpenApiDocument): {
@@ -642,6 +713,30 @@ export class ApiFoxServer {
     };
   }
 
+  private async handleCallErpApi(args: {
+    method: "GET" | "POST" | "PUT" | "DELETE";
+    path: string;
+    query?: Record<string, unknown>;
+    body?: Record<string, unknown>;
+    token: string;
+  }): Promise<unknown> {
+    console.error("[call-erp-api] method=", args.method, "path=", args.path);
+
+    if (!args.path || !args.path.trim()) {
+      return {
+        error: "path 不能为空",
+      };
+    }
+
+    if (!args.token || !args.token.trim()) {
+      return {
+        error: "token 不能为空",
+      };
+    }
+
+    return this.callErpApi(args);
+  }
+
   // 注册工具
   private registerTools(): void {
     this.server.tool(
@@ -679,6 +774,34 @@ export class ApiFoxServer {
       },
       async (args: { keyword: string }) => {
         const result = await this.handleGetInterface(args.keyword);
+        return this.toTextContent(result);
+      }
+    );
+
+    this.server.tool(
+      "call-erp-api",
+      "调用 ERP 实际接口并返回响应 JSON",
+      {
+        method: z.enum(["GET", "POST", "PUT", "DELETE"]),
+        path: z.string().min(1).describe("接口路径，例如 /api/purchase-orders"),
+        query: z
+          .record(z.unknown())
+          .optional()
+          .describe("GET 查询参数对象，路径会自动拼接到 URL"),
+        body: z
+          .record(z.unknown())
+          .optional()
+          .describe("POST/PUT 请求体对象，将以 JSON 发送"),
+        token: z.string().min(1).describe("ERP token"),
+      },
+      async (args: {
+        method: "GET" | "POST" | "PUT" | "DELETE";
+        path: string;
+        query?: Record<string, unknown>;
+        body?: Record<string, unknown>;
+        token: string;
+      }) => {
+        const result = await this.handleCallErpApi(args);
         return this.toTextContent(result);
       }
     );
