@@ -29,6 +29,16 @@ type InterfaceSummary = {
   tags: string[];
 };
 
+type EndpointFetchDiagnostics = {
+  endpoint: string;
+  status?: number;
+  ok: boolean;
+  parsed: boolean;
+  candidateCount: number;
+  bodyPreview: string;
+  error?: string;
+};
+
 const MODULE_MAP: ModuleMapItem[] = [
   {
     moduleId: "REPLACE_WITH_REAL_APIFOX_FOLDER_ID_PURCHASE",
@@ -239,8 +249,12 @@ export class ApiFoxServer {
     }
   }
 
-  private async fetchModuleCandidatesFromApifoxApi(): Promise<ModuleMapItem[]> {
+  private async fetchModuleCandidatesFromApifoxApi(): Promise<{
+    candidates: ModuleMapItem[];
+    diagnostics: EndpointFetchDiagnostics[];
+  }> {
     const results: ModuleMapItem[] = [];
+    const diagnostics: EndpointFetchDiagnostics[] = [];
 
     for (const endpointTemplate of this.folderListEndpoints) {
       const endpoint = endpointTemplate.replace("{projectId}", this.projectId);
@@ -259,31 +273,68 @@ export class ApiFoxServer {
         );
 
         const rawText = await response.text();
+        const bodyPreview = this.summarizeText(rawText);
         console.error(
           "[ApiFox MCP] search-module endpoint raw body preview:",
-          this.summarizeText(rawText)
+          bodyPreview
         );
 
         if (!response.ok) {
+          diagnostics.push({
+            endpoint,
+            status: response.status,
+            ok: false,
+            parsed: false,
+            candidateCount: 0,
+            bodyPreview,
+          });
           continue;
         }
 
         const json = this.safeJsonParse(rawText);
         if (!json) {
+          diagnostics.push({
+            endpoint,
+            status: response.status,
+            ok: true,
+            parsed: false,
+            candidateCount: 0,
+            bodyPreview,
+          });
           continue;
         }
 
+        const beforeCount = results.length;
         this.collectModuleCandidatesFromObject(json, results);
+        diagnostics.push({
+          endpoint,
+          status: response.status,
+          ok: true,
+          parsed: true,
+          candidateCount: results.length - beforeCount,
+          bodyPreview,
+        });
       } catch (error) {
         console.error(
           "[ApiFox MCP] search-module endpoint request failed:",
           endpoint,
           error
         );
+        diagnostics.push({
+          endpoint,
+          ok: false,
+          parsed: false,
+          candidateCount: 0,
+          bodyPreview: "",
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 
-    return this.dedupeModules(results);
+    return {
+      candidates: this.dedupeModules(results),
+      diagnostics,
+    };
   }
 
   private matchModules(keyword: string, modules: ModuleMapItem[]): ModuleMapItem[] {
@@ -392,15 +443,33 @@ export class ApiFoxServer {
   private async handleSearchModule(keyword: string): Promise<{
     keyword: string;
     matched: ModuleMapItem[];
+    candidateCount: number;
+    preview: ModuleMapItem[];
+    diagnostics: EndpointFetchDiagnostics[];
     message?: string;
   }> {
     console.error("[ApiFox MCP] search-module called with keyword:", keyword);
 
-    const apiCandidates = await this.fetchModuleCandidatesFromApifoxApi();
+    const { candidates: apiCandidates, diagnostics } =
+      await this.fetchModuleCandidatesFromApifoxApi();
     const sourceCandidates = this.dedupeModules([
       ...apiCandidates,
       ...MODULE_MAP.filter((module) => this.isUsableModule(module)),
     ]);
+    const preview = sourceCandidates.slice(0, 20);
+
+    if (!keyword.trim()) {
+      return {
+        keyword,
+        matched: preview,
+        preview,
+        candidateCount: sourceCandidates.length,
+        diagnostics,
+        message: sourceCandidates.length
+          ? "未提供关键词，已返回可用模块预览。"
+          : "未提供关键词，但没有拉到任何可用模块。请检查 APIFOX_API_KEY、PROJECT_ID 和 APIFOX_FOLDER_LIST_ENDPOINTS。",
+      };
+    }
 
     const matched = this.matchModules(keyword, sourceCandidates);
 
@@ -408,14 +477,22 @@ export class ApiFoxServer {
       return {
         keyword,
         matched,
+        preview,
+        candidateCount: sourceCandidates.length,
+        diagnostics,
       };
     }
 
     return {
       keyword,
       matched: [],
+      preview,
+      candidateCount: sourceCandidates.length,
+      diagnostics,
       message:
-        "未找到匹配模块。请检查项目下的真实 Apifox folder 列表，或通过 APIFOX_FOLDER_LIST_ENDPOINTS 配置正确的目录查询接口。",
+        sourceCandidates.length > 0
+          ? "未找到匹配模块，但已成功拉到候选列表。请换一个关键词，或查看 preview/diagnostics 里的模块名称。"
+          : "未找到匹配模块，因为没有拉到任何可用候选。请检查 APIFOX_API_KEY、PROJECT_ID 和 APIFOX_FOLDER_LIST_ENDPOINTS。",
     };
   }
 
@@ -506,12 +583,12 @@ export class ApiFoxServer {
   private registerTools(): void {
     this.server.tool(
       "search-module",
-      "根据关键词搜索 Apifox 模块/文件夹，返回可用于 get-interface 的 moduleId",
+      "根据关键词搜索 Apifox 模块/文件夹；关键词可留空以预览可用模块",
       {
         keyword: z
           .string()
-          .min(1)
-          .describe("模块关键词，例如 采购、采购订单、库存、销售"),
+          .default("")
+          .describe("模块关键词，例如 采购、采购订单、库存、销售；可留空"),
       },
       async (args: { keyword: string }) => {
         const result = await this.handleSearchModule(args.keyword);
