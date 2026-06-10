@@ -33,6 +33,40 @@ type InterfaceSummary = {
   tags: string[];
   apifoxFolders: string[];
   apifoxTags: string[];
+  parameters: ParameterSummary[];
+  requestBody: RequestBodySummary | null;
+  schema: SchemaSummary | null;
+  required: boolean;
+};
+
+type ParameterSummary = {
+  name: string;
+  in: string;
+  required: boolean;
+  schemaType: string | null;
+  description?: string;
+};
+
+type SchemaSummary = {
+  type: string | null;
+  format: string | null;
+  description: string | null;
+  required: string[];
+  properties: Array<{
+    name: string;
+    type: string | null;
+    required: boolean;
+    description: string | null;
+  }>;
+  itemsType: string | null;
+  enum: string[];
+};
+
+type RequestBodySummary = {
+  required: boolean;
+  description: string | null;
+  contentTypes: string[];
+  schema: SchemaSummary | null;
 };
 
 type SearchMatch = {
@@ -48,6 +82,10 @@ type InterfaceMatch = {
   tags: string[];
   apifoxFolders: string[];
   apifoxTags: string[];
+  parameters: ParameterSummary[];
+  requestBody: RequestBodySummary | null;
+  schema: SchemaSummary | null;
+  required: boolean;
   score: number;
   matchedFields: string[];
 };
@@ -256,6 +294,128 @@ export class ApiFoxServer {
     const evidence: string[] = [];
     this.collectStrings(value, evidence);
     return this.dedupeStrings(evidence);
+  }
+
+  private extractParameterSummary(value: unknown): ParameterSummary | null {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    const record = value as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    if (!name) {
+      return null;
+    }
+
+    const location = typeof record.in === "string" ? record.in.trim() : "";
+    if (!location) {
+      return null;
+    }
+
+    const schema = record.schema && typeof record.schema === "object"
+      ? (record.schema as Record<string, unknown>)
+      : null;
+
+    const schemaType =
+      schema && typeof schema.type === "string" ? schema.type : null;
+
+    return {
+      name,
+      in: location,
+      required: Boolean(record.required),
+      schemaType,
+      description: typeof record.description === "string" ? record.description : undefined,
+    };
+  }
+
+  private extractSchemaSummary(value: unknown): SchemaSummary | null {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    const record = value as Record<string, unknown>;
+    const propertiesRecord =
+      record.properties && typeof record.properties === "object"
+        ? (record.properties as Record<string, unknown>)
+        : {};
+    const requiredNames = Array.isArray(record.required)
+      ? record.required
+          .map((item) => (typeof item === "string" ? item.trim() : ""))
+          .filter(Boolean)
+      : [];
+
+    const properties = Object.entries(propertiesRecord).map(([name, property]) => {
+      const propertyRecord =
+        property && typeof property === "object"
+          ? (property as Record<string, unknown>)
+          : {};
+      return {
+        name,
+        type: typeof propertyRecord.type === "string" ? propertyRecord.type : null,
+        required: requiredNames.includes(name),
+        description:
+          typeof propertyRecord.description === "string"
+            ? propertyRecord.description
+            : null,
+      };
+    });
+
+    const itemsType =
+      record.items && typeof record.items === "object" &&
+      typeof (record.items as Record<string, unknown>).type === "string"
+        ? ((record.items as Record<string, unknown>).type as string)
+        : null;
+
+    const enumValues = Array.isArray(record.enum)
+      ? record.enum
+          .map((item) => (typeof item === "string" ? item : typeof item === "number" ? String(item) : ""))
+          .filter(Boolean)
+      : [];
+
+    return {
+      type: typeof record.type === "string" ? record.type : null,
+      format: typeof record.format === "string" ? record.format : null,
+      description: typeof record.description === "string" ? record.description : null,
+      required: requiredNames,
+      properties,
+      itemsType,
+      enum: enumValues,
+    };
+  }
+
+  private extractRequestBodySummary(value: unknown): RequestBodySummary | null {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    const record = value as Record<string, unknown>;
+    const content =
+      record.content && typeof record.content === "object"
+        ? (record.content as Record<string, unknown>)
+        : {};
+    const contentTypes = this.dedupeStrings(Object.keys(content));
+    let schema: SchemaSummary | null = null;
+
+    for (const contentValue of Object.values(content)) {
+      if (!contentValue || typeof contentValue !== "object") {
+        continue;
+      }
+
+      const mediaType = contentValue as Record<string, unknown>;
+      if (mediaType.schema && typeof mediaType.schema === "object") {
+        schema = this.extractSchemaSummary(mediaType.schema);
+        if (schema) {
+          break;
+        }
+      }
+    }
+
+    return {
+      required: Boolean(record.required),
+      description: typeof record.description === "string" ? record.description : null,
+      contentTypes,
+      schema,
+    };
   }
 
   private scoreKeywordMatch(keyword: string, candidate: string): number {
@@ -477,6 +637,14 @@ export class ApiFoxServer {
         const operationTags = this.extractTextArray(operationRecord.tags);
         const apifoxFolders = this.collectPathEvidence(operationRecord["x-apifox-folder"]);
         const apifoxTags = this.collectPathEvidence(operationRecord["x-apifox-tags"]);
+        const parameters = Array.isArray(operationRecord.parameters)
+          ? operationRecord.parameters
+              .map((item) => this.extractParameterSummary(item))
+              .filter((item): item is ParameterSummary => item !== null)
+          : [];
+        const requestBody = this.extractRequestBodySummary(operationRecord.requestBody);
+        const schema = requestBody?.schema ?? null;
+        const required = parameters.some((parameter) => parameter.required) || Boolean(requestBody?.required);
 
         interfaces.push({
           method: method.toUpperCase(),
@@ -486,6 +654,10 @@ export class ApiFoxServer {
           tags: operationTags,
           apifoxFolders,
           apifoxTags,
+          parameters,
+          requestBody,
+          schema,
+          required,
         });
       }
     }
@@ -580,6 +752,10 @@ export class ApiFoxServer {
         tags: item.tags,
         apifoxFolders: item.apifoxFolders,
         apifoxTags: item.apifoxTags,
+        parameters: item.parameters,
+        requestBody: item.requestBody,
+        schema: item.schema,
+        required: item.required,
         score,
         matchedFields,
       });
@@ -706,6 +882,10 @@ export class ApiFoxServer {
         tags: best.tags,
         apifoxFolders: best.apifoxFolders,
         apifoxTags: best.apifoxTags,
+        parameters: best.parameters,
+        requestBody: best.requestBody,
+        schema: best.schema,
+        required: best.required,
       },
       score: best.score,
       matchedFields: best.matchedFields,

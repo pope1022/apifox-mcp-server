@@ -76,6 +76,9 @@
 - 然后严格依据接口定义组装参数
 - 再调用 `call-erp-api` 请求 ERP
 
+调用 `call-erp-api` 时，必须严格按照接口返回的 `parameters` 字段中定义的参数名传参。
+禁止猜测或改写参数名，例如 `order_number`、`purchase_order_number` 等不在定义中的字段。
+
 禁止猜测接口名称。
 禁止根据经验臆断接口路径。
 禁止传递接口定义中不存在的参数。
